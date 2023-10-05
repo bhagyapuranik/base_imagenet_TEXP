@@ -11,7 +11,7 @@ from models import *
 from data_loader import data_loader
 from helper import AverageMeter, save_checkpoint, accuracy, adjust_learning_rate
 
-from texp_utils import TexpNormalization, AdaptiveThreshold, ImplicitNormalizationConv
+from texp_utils import *
 
 model_names = [
     'alexnet', 'squeezenet1_0', 'squeezenet1_1', 'densenet121',
@@ -107,12 +107,16 @@ def main():
         raise NotImplementedError
 
     ################# Hack to add TEXP-1 over the model:
-    tinf = 0.0824 # 0.0824 is 1/sqrt(D)
+    tinf = 8*0.0824 # 0.0824 is 1/sqrt(D)
     std_scale = 0.5
+    t_train = 8*tinf
+    alpha1 = 0.001
 
     model.conv1 = ImplicitNormalizationConv(in_channels=3, out_channels=64, kernel_size=(7,7), stride=(2,2), padding=(3,3), bias=False)
     model.bn1 = TexpNormalization(tilt=tinf)
     model.relu = AdaptiveThreshold(std_scalar=std_scale, mean_plus_std=True)
+
+    model = SpecificLayerTypeOutputExtractor_wrapper(model=model)
 
     ###################################################
 
@@ -152,7 +156,7 @@ def main():
         adjust_learning_rate(optimizer, epoch, args.lr)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args.print_freq)
+        texp_train(train_loader, model, criterion, optimizer, epoch, args.print_freq, tilt_train=t_train, alpha=alpha1)
 
         # evaluate on validation set
         prec1, prec5 = validate(val_loader, model, criterion, args.print_freq)
@@ -167,7 +171,7 @@ def main():
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
             'optimizer': optimizer.state_dict()
-        }, is_best, args.arch + '_TEXP1_tinf' + str(tinf) + '_stdScale' + str(std_scale)+'.pth')
+        }, is_best, args.arch + '_TEXP1_tinf' + str(tinf) + '_t_train' + str(t_train) + '_alpha'+str(alpha1)+'_stdScale' + str(std_scale)+'.pth')
     
     # evaluate on validation set
     prec1, prec5 = validate(val_loader, model, criterion, args.print_freq)
@@ -260,6 +264,69 @@ def validate(val_loader, model, criterion, print_freq):
     print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
 
     return top1.avg, top5.avg
+
+
+
+def texp_train(train_loader, model, criterion, optimizer, epoch, print_freq, tilt_train, alpha):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    wt_texp_objs = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        target = target.cuda(non_blocking=True)
+        input = input.cuda(non_blocking=True)
+
+        # compute output
+        output = model(input)
+
+        loss = criterion(output, target)
+        wt_texp_obj = -alpha*tilted_loss(activations=model.layer_outputs['conv1'], tilt=tilt_train)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.item(), input.size(0))
+        wt_texp_objs.update(wt_texp_obj.item(), input.size(0))
+        top1.update(prec1[0], input.size(0))
+        top5.update(prec1[0], input.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+
+        # Backprop the texp loss
+        if model.conv1.weight.grad is not None:
+            model.conv1.weight.grad.zero_()
+        wt_texp_obj.backward(retain_graph=True)
+
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        breakpoint()
+        if i % print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Weighted neg-Texp-obj {wt_texp_obj.val:.4f} ({wt_texp_obj.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, wt_texp_obj=wt_texp_objs, top1=top1, top5=top5))
+
+
+
 
 
 if __name__ == '__main__':

@@ -85,3 +85,96 @@ class AdaptiveThreshold(nn.Module):
         else:
             s = f"AdaptiveThreshold(std_scalar={self.std_scalar})"
         return s'''
+
+
+from typing import Dict, Iterable, Callable
+from collections import OrderedDict
+
+class SpecificLayerTypeOutputExtractor_wrapper(nn.Module):
+    def __init__(self, model: nn.Module, layer_type = nn.Conv2d):
+        super().__init__()
+        self._model = model
+        self.layer_type = layer_type
+
+        
+        
+        self.hook_handles = {}
+
+        self.layer_outputs = OrderedDict()
+        self.layer_inputs = OrderedDict()
+        self.layers_of_interest = OrderedDict()
+
+        for layer_id, layer in model.named_modules():
+            if isinstance(layer, layer_type) and ('conv1' ==layer_id): #'layer1' in layer_id or 
+                print(layer_id)
+                self.layer_outputs[layer_id] = torch.empty(0)
+                self.layer_inputs[layer_id] = torch.empty(0)
+                self.layers_of_interest[layer_id] = layer
+
+        for layer_id, layer in model.named_modules():
+            if isinstance(layer, layer_type)  and ( 'conv1' ==layer_id): #'layer1' in layer_id or
+                self.hook_handles[layer_id] = layer.register_forward_hook(
+                    self.generate_hook_fn(layer_id))
+                    
+    def generate_hook_fn(self, layer_id: str) -> Callable:
+        def fn(_, input, output):
+            self.layer_outputs[layer_id] = output
+            self.layer_inputs[layer_id] = input[0]
+        return fn
+
+    def close(self):
+        [hook_handle.remove() for hook_handle in self.hook_handles.values()]
+
+    def forward(self, x):
+        return self._model(x)
+
+    def __getattribute__(self, name: str):
+        # the last three are used in nn.Module.__setattr__
+        if name in ["_model", "layers_of_interest", "layer_outputs", "layer_inputs", "hook_handles", "generate_hook_fn", "close", "__dict__", "_parameters", "_buffers", "_non_persistent_buffers_set", "call_super_init"]:
+            return object.__getattribute__(self, name)
+        else:
+            return getattr(self._model, name)
+        
+
+from optparse import Option
+from typing import Dict, Union, Tuple, Optional
+import torch.nn.functional as F
+import math
+
+def tilted_loss(activations: torch.Tensor, tilt: float,  
+                relu_on=False, anti_hebb=False, texp_across_filts_only=True, patches: Optional[torch.Tensor] = None, weights:Optional[torch.Tensor] = None, **kwargs):
+    if relu_on:
+        activations = F.relu(activations)
+    
+    normalization = False # ALWAYS FALSE
+    
+
+    scaling_by_num_acts = True # Normalizes arguments of logsumexp by the number of activations, always true
+
+    if anti_hebb:
+        mean_subtraction = True # Subtracts the mean of the activations before exponentiating
+    else:
+        mean_subtraction = False
+
+    if mean_subtraction:
+        if texp_across_filts_only:
+            mean_acts = torch.mean(activations, dim=(1), keepdim=True)
+        else:
+            mean_acts = torch.mean(activations, dim=(1,2,3), keepdim=True)
+    else:
+        mean_acts = torch.zeros_like(activations)
+
+    # If no normalization is employed:
+    if normalization == False:
+        if scaling_by_num_acts:
+            if texp_across_filts_only:
+                return (1/(activations.shape[2]*activations.shape[3]))*(1/tilt)*torch.add( torch.sum(torch.logsumexp(tilt*(activations-mean_acts), dim=(1))), (activations.nelement()/activations.shape[1])*math.log(1/activations.shape[1]) )
+            else:
+                return (1/tilt)*torch.add( torch.sum(torch.logsumexp(tilt*(activations-mean_acts), dim=(1,2,3))), activations.shape[0]*math.log(activations.shape[0]/activations.nelement()) )
+        else:
+            if texp_across_filts_only:
+                return (1/tilt)*torch.sum(torch.logsumexp(tilt*(activations - mean_acts), dim=(1)))
+            return (1/tilt)*torch.sum(torch.logsumexp(tilt*(activations - mean_acts), dim=(1,2,3)))
+    
+
+
