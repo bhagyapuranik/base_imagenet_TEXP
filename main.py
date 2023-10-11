@@ -1,3 +1,6 @@
+"""
+python main.py '/home/bhagyap/datasets/ImageNet-2012_v2/' -a resnet50 --lr 0.1
+"""
 import argparse
 import os
 import time
@@ -109,8 +112,9 @@ def main():
     ################# Hack to add TEXP-1 over the model:
     tinf = 8*0.0824 # 0.0824 is 1/sqrt(D)
     std_scale = 0.5
-    t_train = 8*tinf
-    alpha1 = 0.001
+    t_train = 10*tinf
+    alpha1 = 0.01
+    anti_hebb = False # Anti-Hebbian term for TEXP cost only.
 
     model.conv1 = ImplicitNormalizationConv(in_channels=3, out_channels=64, kernel_size=(7,7), stride=(2,2), padding=(3,3), bias=False)
     model.bn1 = TexpNormalization(tilt=tinf)
@@ -130,6 +134,9 @@ def main():
                           momentum=args.momentum,
                           weight_decay=args.weight_decay)
 
+
+
+
     # optionlly resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -139,9 +146,22 @@ def main():
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+
+
+            # Hack 2 for resuming training:
+            #checkpoint['epoch'] = 50
+            #args.start_epoch = checkpoint['epoch']
+            #checkpoint['optimizer']['param_groups'][0]['lr'] = 0.01
+            #################################
+
             print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
     else:
         print("=> no checkpoint found at '{}'".format(args.resume))
+    
+    # Freeze the first layer weights!
+    #model.conv1.weight.requires_grad_(False)
+    #args.evaluate = False
+    #print('WARNING!!!! HACKED heavily here and at args.resume and inside texp-train')
 
     # cudnn.benchmark = True
 
@@ -153,10 +173,14 @@ def main():
         return
 
     for epoch in range(args.start_epoch, args.epochs):
+        if epoch == 10:
+            breakpoint()
+        elif epoch == 20:
+            breakpoint()
         adjust_learning_rate(optimizer, epoch, args.lr)
 
         # train for one epoch
-        texp_train(train_loader, model, criterion, optimizer, epoch, args.print_freq, tilt_train=t_train, alpha=alpha1)
+        texp_train(train_loader, model, criterion, optimizer, epoch, args.print_freq, tilt_train=t_train, alpha=alpha1, anti_hebb=anti_hebb)
 
         # evaluate on validation set
         prec1, prec5 = validate(val_loader, model, criterion, args.print_freq)
@@ -171,7 +195,7 @@ def main():
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
             'optimizer': optimizer.state_dict()
-        }, is_best, args.arch + '_TEXP1_tinf' + str(tinf) + '_t_train' + str(t_train) + '_alpha'+str(alpha1)+'_stdScale' + str(std_scale)+'.pth')
+        }, is_best, args.arch + '_TEXP1_tinf' + str(tinf) + '_t_train' + str(t_train) + '_alpha'+str(alpha1)+'_stdScale' +'_frozen_new_epoch' +str(epoch) + str(std_scale)+'.pth')
     
     # evaluate on validation set
     prec1, prec5 = validate(val_loader, model, criterion, args.print_freq)
@@ -267,7 +291,7 @@ def validate(val_loader, model, criterion, print_freq):
 
 
 
-def texp_train(train_loader, model, criterion, optimizer, epoch, print_freq, tilt_train, alpha):
+def texp_train(train_loader, model, criterion, optimizer, epoch, print_freq, tilt_train, alpha, anti_hebb):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -290,7 +314,7 @@ def texp_train(train_loader, model, criterion, optimizer, epoch, print_freq, til
         output = model(input)
 
         loss = criterion(output, target)
-        wt_texp_obj = -alpha*tilted_loss(activations=model.layer_outputs['conv1'], tilt=tilt_train)
+        wt_texp_obj = -alpha*tilted_loss(activations=model.layer_outputs['conv1'], tilt=tilt_train, anti_hebb=anti_hebb)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -313,7 +337,6 @@ def texp_train(train_loader, model, criterion, optimizer, epoch, print_freq, til
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-        breakpoint()
         if i % print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
